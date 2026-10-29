@@ -22,11 +22,18 @@ def _bedrock_to_openai(message: dict) -> dict:
 
     if content and "toolResult" in content[0]:
         tool_result = content[0]["toolResult"]
-        text_parts = [c.get("text", "") for c in tool_result.get("content", []) if "text" in c]
+        tool_content = tool_result.get("content", [])
+        text_parts = [
+            item["text"] if "text" in item else json.dumps(item["json"])
+            for item in tool_content
+            if "text" in item or "json" in item
+        ]
         result = {
             "role": "tool",
             "tool_call_id": tool_result["toolUseId"],
             "content": "\n".join(text_parts),
+            # Storage-only extension preserves the original structured blocks on restore.
+            "_strands_tool_result_content": [encode_bytes_values(item) for item in tool_content],
         }
         if "status" in tool_result:
             result["status"] = tool_result["status"]
@@ -80,9 +87,15 @@ def _openai_to_bedrock(openai_msg: dict) -> dict:
     reasoning_items: list[dict[str, Any]] = []
 
     if role == "tool":
+        stored_content = openai_msg.get("_strands_tool_result_content")
+        tool_content = (
+            [decode_bytes_values(item) for item in stored_content]
+            if isinstance(stored_content, list)
+            else [{"text": openai_msg.get("content", "")}]
+        )
         tool_result: dict[str, Any] = {
             "toolUseId": openai_msg["tool_call_id"],
-            "content": [{"text": openai_msg.get("content", "")}],
+            "content": tool_content,
         }
         if "status" in openai_msg:
             tool_result["status"] = openai_msg["status"]
@@ -147,6 +160,15 @@ class OpenAIConverseConverter:
         if not has_non_empty:
             return []
 
+        if any("toolResult" in item for item in content):
+            # Strands stores parallel tool results as blocks of a single user turn.
+            # OpenAI stores each result as its own tool message.
+            return [
+                (json.dumps(_bedrock_to_openai({"role": "user", "content": [item]})), "tool")
+                for item in content
+                if "toolResult" in item
+            ]
+
         openai_msg = _bedrock_to_openai(message)
         role = openai_msg.get("role", "user")
         return [(json.dumps(openai_msg), role)]
@@ -180,8 +202,15 @@ class OpenAIConverseConverter:
                 if openai_msg and isinstance(openai_msg, dict):
                     bedrock_msg = _openai_to_bedrock(openai_msg)
                     if bedrock_msg.get("content"):
-                        session_msg = SessionMessage(message=bedrock_msg, message_id=0)
-                        messages.append(session_msg)
+                        if (
+                            openai_msg.get("role") == "tool"
+                            and messages
+                            and all("toolResult" in item for item in messages[-1].message["content"])
+                        ):
+                            # Bedrock requires parallel tool results in a single user turn.
+                            messages[-1].message["content"].extend(bedrock_msg["content"])
+                        else:
+                            messages.append(SessionMessage(message=bedrock_msg, message_id=0))
 
         return messages
 
